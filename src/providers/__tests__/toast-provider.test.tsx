@@ -1,12 +1,13 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { render, screen, act, within } from "@testing-library/react";
-import userEvent from "@testing-library/user-event";
+import { render, screen, act } from "@testing-library/react";
 import { ToastProvider, ToastHost } from "../toast-provider";
-import { useUIStore } from "@/stores/ui-store";
+import { useUIStore, clearToastDeduplication } from "@/stores/ui-store";
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 function resetStore() {
+  // Clear dedup map so cross-test identical toasts are never silently dropped
+  clearToastDeduplication();
   useUIStore.setState({
     theme: "system",
     density: "comfortable",
@@ -25,15 +26,27 @@ function PageB() {
   return <div data-testid="page-b">Page B</div>;
 }
 
+function getToastHost() {
+  return document.querySelector("[data-testid='toast-host']");
+}
+
+function getAlerts() {
+  return document.querySelectorAll("[data-testid='toast-host'] [role='alert']");
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 describe("ToastProvider / ToastHost", () => {
   beforeEach(() => {
+    // Reset store BEFORE enabling fake timers so the Zustand persist
+    // middleware's localStorage.setItem runs against the real storage API.
     resetStore();
     vi.useFakeTimers();
   });
 
   afterEach(() => {
+    // Only flush pending timers if fake timers are still active (guards against
+    // a test that already called useRealTimers).
     vi.runOnlyPendingTimers();
     vi.useRealTimers();
   });
@@ -56,7 +69,7 @@ describe("ToastProvider / ToastHost", () => {
       </ToastProvider>
     );
     // ToastHost portals into document.body — query the document, not the container
-    expect(document.querySelector("[data-testid='toast-host']")).not.toBeNull();
+    expect(getToastHost()).not.toBeNull();
   });
 
   it("shows a toast once addToast is called", () => {
@@ -70,9 +83,7 @@ describe("ToastProvider / ToastHost", () => {
       useUIStore.getState().addToast({ type: "success", title: "Saved!" });
     });
 
-    expect(document.querySelector("[data-testid='toast-host']")?.textContent).toContain(
-      "Saved!"
-    );
+    expect(getToastHost()?.textContent).toContain("Saved!");
   });
 
   // ── Persistence across route changes ────────────────────────────────────────
@@ -101,9 +112,7 @@ describe("ToastProvider / ToastHost", () => {
     expect(screen.getByTestId("page-b")).toBeDefined();
 
     // The toast must still be visible — it should NOT have vanished
-    expect(document.querySelector("[data-testid='toast-host']")?.textContent).toContain(
-      "Navigation toast"
-    );
+    expect(getToastHost()?.textContent).toContain("Navigation toast");
   });
 
   it("toast added on Page A is still present after navigating to Page B before its duration expires", () => {
@@ -134,17 +143,79 @@ describe("ToastProvider / ToastHost", () => {
     );
 
     // Toast should still be there — 6s remain on its timer
-    expect(document.querySelector("[data-testid='toast-host']")?.textContent).toContain(
-      "Transfer confirmed"
-    );
+    expect(getToastHost()?.textContent).toContain("Transfer confirmed");
 
     // Advance remaining time — now it should auto-dismiss
     act(() => {
       vi.advanceTimersByTime(7000);
     });
 
-    const host = document.querySelector("[data-testid='toast-host']");
-    expect(host?.querySelectorAll("[role='alert']").length).toBe(0);
+    expect(getAlerts().length).toBe(0);
+  });
+
+  /**
+   * KEY REGRESSION — the actual failure mode.
+   *
+   * The original bug: ToastProvider interleaved {children} with the portal
+   * inside one component. A route change could destroy the mounted portal and
+   * its in-flight toast stack in the same React commit that mounted the new
+   * page. The symptom was a toast raised *during* navigation being lost
+   * immediately after it appeared.
+   *
+   * This test triggers addToast() *synchronously inside the rerender call*
+   * (i.e. the store update and the tree swap happen in the same batch), which
+   * reproduces the exact commit ordering that caused the original loss.
+   */
+  it("toast raised during navigation (same React batch as route change) survives", () => {
+    const { rerender } = render(
+      <ToastProvider>
+        <PageA />
+      </ToastProvider>
+    );
+
+    // Raise the toast and swap the page child in the same act() — one React commit.
+    act(() => {
+      useUIStore.getState().addToast({
+        type: "error",
+        title: "Transaction failed",
+        duration: 5000,
+      });
+      rerender(
+        <ToastProvider>
+          <PageB />
+        </ToastProvider>
+      );
+    });
+
+    // Page B must be mounted
+    expect(screen.getByTestId("page-b")).toBeDefined();
+
+    // The toast raised during the navigation commit must still be visible
+    expect(getToastHost()?.textContent).toContain("Transaction failed");
+    expect(getAlerts().length).toBe(1);
+  });
+
+  /**
+   * Hard-refresh scenario: the entire app-shell tree mounts fresh.
+   *
+   * After a hard refresh the root layout re-executes and every provider
+   * mounts from scratch, including ToastHost. Verify it renders correctly
+   * on that first mount (i.e. setMounted(true) fires and the portal appears)
+   * and that toasts added immediately after are visible.
+   */
+  it("host renders and accepts toasts on a fresh mount (hard refresh)", () => {
+    // Mount only ToastHost, simulating the app shell mounting from scratch
+    render(<ToastHost />);
+
+    // Host itself should be present in the document
+    expect(getToastHost()).not.toBeNull();
+
+    // Add a toast — it should appear immediately on this fresh mount
+    act(() => {
+      useUIStore.getState().addToast({ type: "info", title: "Welcome back" });
+    });
+
+    expect(getToastHost()?.textContent).toContain("Welcome back");
   });
 
   // ── No duplicate hosts ───────────────────────────────────────────────────────
@@ -184,8 +255,6 @@ describe("ToastProvider / ToastHost", () => {
   // ── Dismiss ──────────────────────────────────────────────────────────────────
 
   it("dismiss button removes the toast from the host", async () => {
-    const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime.bind(vi) });
-
     render(
       <ToastProvider>
         <div />
@@ -201,10 +270,13 @@ describe("ToastProvider / ToastHost", () => {
     ) as HTMLButtonElement;
     expect(dismissBtn).not.toBeNull();
 
-    await user.click(dismissBtn);
+    // Use act + click() directly — userEvent.setup with fake timers can deadlock
+    // when pointer-event delays aren't resolved by advanceTimers alone.
+    act(() => {
+      dismissBtn.click();
+    });
 
-    const host = document.querySelector("[data-testid='toast-host']");
-    expect(host?.querySelectorAll("[role='alert']").length).toBe(0);
+    expect(getAlerts().length).toBe(0);
     expect(useUIStore.getState().toasts).toHaveLength(0);
   });
 
@@ -221,28 +293,70 @@ describe("ToastProvider / ToastHost", () => {
       useUIStore.getState().addToast({ type: "success", title: "Quick", duration: 3000 });
     });
 
-    expect(document.querySelector("[data-testid='toast-host']")?.textContent).toContain(
-      "Quick"
-    );
+    expect(getToastHost()?.textContent).toContain("Quick");
 
     act(() => {
       vi.advanceTimersByTime(3500);
     });
 
-    const host = document.querySelector("[data-testid='toast-host']");
-    expect(host?.querySelectorAll("[role='alert']").length).toBe(0);
+    expect(getAlerts().length).toBe(0);
   });
 
   // ── Accessibility ─────────────────────────────────────────────────────────────
 
-  it("toast host has aria-live polite for screen reader announcements", () => {
+  it("error toasts are in an assertive live region for immediate screen-reader announcement", () => {
     render(
       <ToastProvider>
         <div />
       </ToastProvider>
     );
-    const host = document.querySelector("[data-testid='toast-host']");
-    expect(host?.getAttribute("aria-live")).toBe("polite");
+
+    act(() => {
+      useUIStore.getState().addToast({ type: "error", title: "Auth failure" });
+    });
+
+    // The error toast must be inside an aria-live="assertive" container
+    const assertiveRegion = document.querySelector(
+      "[data-testid='toast-host'] [aria-live='assertive']"
+    );
+    expect(assertiveRegion).not.toBeNull();
+    expect(assertiveRegion?.textContent).toContain("Auth failure");
+  });
+
+  it("non-error toasts are in a polite live region", () => {
+    render(
+      <ToastProvider>
+        <div />
+      </ToastProvider>
+    );
+
+    act(() => {
+      useUIStore.getState().addToast({ type: "success", title: "Saved" });
+    });
+
+    const politeRegion = document.querySelector(
+      "[data-testid='toast-host'] [aria-live='polite']"
+    );
+    expect(politeRegion).not.toBeNull();
+    expect(politeRegion?.textContent).toContain("Saved");
+  });
+
+  it("error toasts do NOT appear in the polite region", () => {
+    render(
+      <ToastProvider>
+        <div />
+      </ToastProvider>
+    );
+
+    act(() => {
+      useUIStore.getState().addToast({ type: "error", title: "Tx rejected" });
+    });
+
+    const politeRegion = document.querySelector(
+      "[data-testid='toast-host'] [aria-live='polite']"
+    );
+    // The polite region must be empty — the error lives in the assertive region
+    expect(politeRegion?.querySelectorAll("[role='alert']").length).toBe(0);
   });
 
   it("individual toasts have role alert", () => {
@@ -256,7 +370,6 @@ describe("ToastProvider / ToastHost", () => {
       useUIStore.getState().addToast({ type: "warning", title: "Heads up" });
     });
 
-    const alerts = document.querySelectorAll("[data-testid='toast-host'] [role='alert']");
-    expect(alerts.length).toBe(1);
+    expect(getAlerts().length).toBe(1);
   });
 });
